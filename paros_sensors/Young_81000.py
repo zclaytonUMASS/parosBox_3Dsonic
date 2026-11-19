@@ -3,11 +3,37 @@ import influxdb_client
 from ParosSerialSensor import ParosSerialSensor
 from ParosSensor import ParosSensor
 import serial
-from dotenv import load_dotenv
 import argparse
 import socket
 import pathlib
 import logging
+import math
+
+
+# Wire order for CUSTOM 789AB and 789AB5, respectively. InfluxDB stores
+# named fields, so its serialized field order need not match wire order.
+LEGACY_COLUMNS = (
+    "speed_3d", "azimuth", "elevation", "speed_of_sound", "sonic_temperature",
+)
+UVW_COLUMNS = LEGACY_COLUMNS + ("u", "v", "w")
+
+
+def parse_sample(line):
+    """Parse a complete CR-terminated CUSTOM 789AB or 789AB5 record.
+
+    Missing UVW remains absent for legacy sensors; never manufacture zeros.
+    Values are sensor-native (PCAR uses m/s and degrees Celsius).
+    Numeric validity does not establish acoustic measurement quality.
+    """
+    if not isinstance(line, str) or not line.endswith('\r'):
+        raise ValueError("Incomplete sonic record")
+    parts = line.split()
+    if len(parts) not in (len(LEGACY_COLUMNS), len(UVW_COLUMNS)):
+        raise ValueError("Expected 5 (789AB) or 8 (789AB5) values")
+    values = tuple(float(part) for part in parts)
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Non-finite sonic value")
+    return dict(zip(UVW_COLUMNS, values))
 
 
 class Young_81000(ParosSerialSensor):
@@ -38,39 +64,18 @@ class Young_81000(ParosSerialSensor):
 
                 strIn = super().readSerial(b'\r')
 
-                if strIn is None:
-                    fail_count += 1
-                    continue
-
-                strIn = strIn.strip()
-                if not strIn:
-                    fail_count += 1
-                    continue
-
-                in_parts = strIn.split()
-
-                if len(in_parts) != 5:
-                    fail_count += 1
-                    continue
-
                 try:
-                    speed_3d = float(in_parts[0])
-                    azimuth = float(in_parts[1])
-                    elevation = float(in_parts[2])
-                    speed_of_sound = float(in_parts[3])
-                    sonic_temperature = float(in_parts[4])
-                except ValueError:
+                    fields = parse_sample(strIn)
+                except ValueError as exc:
                     fail_count += 1
+                    logging.warning("Invalid RM Young 81000 record (%s/11): %s", fail_count, exc)
                     continue
 
                 fail_count = 0
 
                 p = influxdb_client.Point(self.box_id)
-                p.field("speed_3d", speed_3d)
-                p.field("azimuth", azimuth)
-                p.field("elevation", elevation)
-                p.field("speed_of_sound", speed_of_sound)
-                p.field("sonic_temperature", sonic_temperature)
+                for name, value in fields.items():
+                    p.field(name, value)
 
                 ParosSensor.addSample(self, p)
 
@@ -80,6 +85,8 @@ class Young_81000(ParosSerialSensor):
 
 
 if __name__ == "__main__":
+    from dotenv import load_dotenv
+
     logging.basicConfig(level=logging.INFO)
 
     file_path = pathlib.Path(__file__).parent.resolve()
